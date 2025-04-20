@@ -2,6 +2,7 @@ import os
 import time
 import random
 import threading
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import credentials
 import pyttsx3
@@ -25,7 +26,7 @@ instance_info = "Unknown"
 is_emoting = False
 movement_paused = False
 fail_count = 0
-current_model = 1
+current_model = 0
 filter_cache = set()
 
 # Initialize HuggingChat
@@ -164,8 +165,7 @@ def check_commands(combined, prompt):
         movement_paused = True
     elif "unpause" in prompt and "move" in prompt:
         movement_paused = False
-    elif "switch" in prompt and "model" in prompt:
-        switch_model()
+    
     is_emoting = False
 
 def speak_text(text):
@@ -200,14 +200,32 @@ def listen_microphone():
         except sr.RequestError as e:
             print(f"Speech recognition request error: {e}")
 
-def switch_model():
-    global fail_count, current_model
-    send_chatbox(f"Model#{current_model} failed. Switching...")
-    fail_count = 0
-    current_model += 1
 
-def ask_huggingchat(prompt):
-    return str(chatbot.chat(prompt))
+def ask_huggingchat(prompt, max_retries=2):
+    global chatbot, current_model
+    retries = 0
+    while retries <= max_retries:
+        try:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(chatbot.chat, prompt)
+                try:
+                    response = future.result(timeout=5)
+                    return str(response)
+                except concurrent.futures.TimeoutError:
+                    
+                    future.cancel()
+                    send_chatbox(f"Response taking too long. Creating new conversation. Retry {retries+1}/{max_retries+1}")
+                    print(f"HuggingChat timeout. Retrying {retries+1}/{max_retries+1}")
+                    chatbot.new_conversation(modelIndex=current_model, system_prompt=credentials.SYSTEM_PROMPT, switch_to=True)
+                    retries += 1
+                    if retries > max_retries:
+                        return "I'm having trouble connecting. Please try again in a moment."
+        except Exception as e:
+            print(f"Error in ask_huggingchat: {e}")
+            chatbot.new_conversation(modelIndex=current_model, system_prompt=credentials.SYSTEM_PROMPT, switch_to=True)
+            retries += 1
+            if retries > max_retries:
+                return f"Error communicating with AI service. Please try again."
 
 def reset_needed(text):
     triggers = ["reset", "restart"]
@@ -225,7 +243,7 @@ def main():
     threading.Thread(target=move_thread, name="MovementThread", daemon=True).start()
     threading.Thread(target=api_thread, name="APIThread", daemon=True).start()
 
-    startup_msg = "This is the lower-end version of Tiger-bee bot. Things will change. " + ask_huggingchat(".")
+    startup_msg = "Tigerbee has restarted. " + ask_huggingchat(".")
     speak_text(startup_msg)
     send_chatbox(startup_msg)
 
@@ -236,11 +254,18 @@ def main():
             try:
                 if reset_needed(spoken):
                     chatbot.new_conversation(modelIndex=current_model, system_prompt=credentials.SYSTEM_PROMPT, switch_to=True)
+                
                 response = ask_huggingchat(spoken)
+                
                 if not is_filtered(response):
-                    if len(response) > 300 or "<assistant" in response:
+                    if "<assistant" in response:
                         chatbot.new_conversation(modelIndex=current_model, system_prompt=credentials.SYSTEM_PROMPT, switch_to=True)
                         send_chatbox("Response was invalid. Resetting conversation.")
+                    if len(response) > 300:
+                        speak_text(response[:300])
+                        send_chatbox(response[:300])
+                        check_commands(spoken + response[:300], spoken)
+                        check_emotes(response[:300]) 
                     else:
                         speak_text(response)
                         send_chatbox(response)
@@ -251,10 +276,6 @@ def main():
             except Exception as e:
                 print("Chat failure:", e)
                 chatbot.new_conversation(modelIndex=current_model, system_prompt=credentials.SYSTEM_PROMPT, switch_to=True)
-                global fail_count
-                fail_count += 1
-                if fail_count > 2:
-                    switch_model()
 
 if __name__ == "__main__":
     main()
